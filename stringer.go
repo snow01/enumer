@@ -32,14 +32,16 @@ import (
 )
 
 var (
-	typeNames       = flag.String("type", "", "comma-separated list of type names; must be set")
-	sql             = flag.Bool("sql", false, "if true, the Scanner and Valuer interface will be implemented.")
-	json            = flag.Bool("json", false, "if true, json marshaling methods will be generated. Default: false")
-	yaml            = flag.Bool("yaml", false, "if true, yaml marshaling methods will be generated. Default: false")
-	text            = flag.Bool("text", false, "if true, text marshaling methods will be generated. Default: false")
-	output          = flag.String("output", "", "output file name; default srcdir/<type>_string.go")
-	transformMethod = flag.String("transform", "noop", "enum item name transformation method. Default: noop")
-	trimPrefix      = flag.String("trimprefix", "", "transform each item name by removing a prefix. Default: \"\"")
+	typeNames    = flag.String("type", "", "comma-separated list of type names; must be set")
+	sql          = flag.Bool("sql", false, "if true, the Scanner and Valuer interface will be implemented.")
+	json         = flag.Bool("json", false, "if true, json marshaling methods will be generated. Default: false")
+	yaml         = flag.Bool("yaml", false, "if true, yaml marshaling methods will be generated. Default: false")
+	text         = flag.Bool("text", false, "if true, text marshaling methods will be generated. Default: false")
+	output       = flag.String("output", "", "output file name; default srcdir/<type>_enumer.go")
+	decodeMethod = flag.String("decode", "", "enum item name decode supports, can be multiple. Default: noop")
+	encodeMethod = flag.String("encode", "", "enum item name encode support, supports single. Default: noop")
+	//transformMethod = flag.String("transform", "noop", "enum item name transformation method. Default: noop")
+	trimPrefix = flag.String("trimprefix", "", "transform each item name by removing a prefix. By default trims typeName")
 )
 
 // Usage is a replacement usage function for the flags package.
@@ -102,7 +104,7 @@ func main() {
 
 	// Run generate for each type.
 	for _, typeName := range types {
-		g.generate(typeName, *json, *yaml, *sql, *text, *transformMethod, *trimPrefix)
+		g.generate(typeName, *json, *yaml, *sql, *text, *encodeMethod, *decodeMethod, *trimPrefix)
 	}
 
 	// Format the output.
@@ -239,19 +241,70 @@ func (pkg *Package) check(fs *token.FileSet, astFiles []*ast.File) {
 	pkg.typesPkg = typesPkg
 }
 
-func (g *Generator) transformValueNames(values []Value, transformMethod string) {
-	var sep rune
-	switch transformMethod {
-	case "snake":
-		sep = '_'
-	case "kebab":
-		sep = '-'
+func transformMethod(method string) (func(v string) string) {
+	var encoder func(v string) string = nil
+
+	// UPPERCASE
+	// LOWERCASE
+	// UPPERCASE_SNAKE
+	// LOWERCASE_SNAKE
+	// UPPERCASE_KEBAB
+	// LOWERCASE_KEBAB
+	switch method {
+	case "uppercase":
+		encoder = func(v string) string {
+			return strings.ToUpper(v)
+		}
+	case "lowercase":
+		encoder = func(v string) string {
+			return strings.ToLower(v)
+		}
+	case "uppercase_snake":
+		encoder = func(v string) string {
+			return strings.ToUpper(name.Delimit(v, '_'))
+		}
+	case "uppercase_kebab":
+		encoder = func(v string) string {
+			return strings.ToUpper(name.Delimit(v, '-'))
+		}
+	case "lowercase_snake":
+		encoder = func(v string) string {
+			return strings.ToLower(name.Delimit(v, '_'))
+		}
+	case "lowercase_kebab":
+		encoder = func(v string) string {
+			return strings.ToLower(name.Delimit(v, '-'))
+		}
 	default:
-		return
+		encoder = func(v string) string {
+			return v
+		}
+	}
+
+	return encoder
+}
+
+func (g *Generator) transformValues(values []Value, encodeMethod string, decodeMethod string) {
+	var decodedMethods = strings.Split(decodeMethod, ",")
+
+	var encoder = transformMethod(encodeMethod)
+	var decoders = make([]func(v string) string, 0, 0)
+
+	for _, method := range decodedMethods {
+		if method != encodeMethod {
+			decoders = append(decoders, transformMethod(method))
+		}
 	}
 
 	for i := range values {
-		values[i].name = strings.ToLower(name.Delimit(values[i].name, sep))
+		// build decodes
+		values[i].decodes = make([]string, 0, 0)
+		for _, decoder := range decoders {
+			values[i].decodes = append(values[i].decodes, decoder(values[i].name))
+		}
+
+		values[i].name = encoder(values[i].name)
+		values[i].decodes = append(values[i].decodes, values[i].name)
 	}
 }
 
@@ -263,7 +316,7 @@ func (g *Generator) trimValueNames(values []Value, prefix string) {
 }
 
 // generate produces the String method for the named type.
-func (g *Generator) generate(typeName string, includeJSON, includeYAML, includeSQL, includeText bool, transformMethod string, trimPrefix string) {
+func (g *Generator) generate(typeName string, includeJSON, includeYAML, includeSQL, includeText bool, encodeMethod string, decodeMethod string, trimPrefix string) {
 	values := make([]Value, 0, 100)
 	for _, file := range g.pkg.files {
 		// Set the state for this run of the walker.
@@ -279,9 +332,13 @@ func (g *Generator) generate(typeName string, includeJSON, includeYAML, includeS
 		log.Fatalf("no values defined for type %s", typeName)
 	}
 
+	if trimPrefix == "" {
+		trimPrefix = typeName
+	}
+
 	g.trimValueNames(values, trimPrefix)
 
-	g.transformValueNames(values, transformMethod)
+	g.transformValues(values, encodeMethod, decodeMethod)
 
 	runs := splitIntoRuns(values)
 	// The decision of which pattern to use depends on the number of
@@ -306,15 +363,15 @@ func (g *Generator) generate(typeName string, includeJSON, includeYAML, includeS
 		g.buildMap(runs, typeName)
 	}
 
-	g.buildBasicExtras(runs, typeName, runsThreshold)
+	g.buildBasicExtras(runs, values, typeName, runsThreshold)
 	if includeJSON {
-		g.buildJSONMethods(runs, typeName, runsThreshold)
+		g.buildJSONMethods(typeName)
 	}
 	if includeText {
-		g.buildTextMethods(runs, typeName, runsThreshold)
+		g.buildTextMethods(typeName)
 	}
 	if includeYAML {
-		g.buildYAMLMethods(runs, typeName, runsThreshold)
+		g.buildYAMLMethods(typeName)
 	}
 	if includeSQL {
 		g.addValueAndScanMethod(typeName)
@@ -368,7 +425,8 @@ func (g *Generator) format() []byte {
 
 // Value represents a declared constant.
 type Value struct {
-	name string // The name of the constant after transformation (i.e. camel case => snake case)
+	name    string // The name of the constant after transformation (i.e. camel case => snake case)
+	decodes []string
 	// The value is stored as a bit pattern alone. The boolean tells us
 	// whether to interpret it as an int64 or a uint64; the only place
 	// this matters is when sorting.
