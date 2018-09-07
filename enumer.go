@@ -4,11 +4,31 @@ package main
 //	[1]: type name
 const stringNameToValueMethod = `// %[1]sString retrieves an enum value from the enum constants string name.
 // Throws an error if the param is not part of the enum.
-func %[1]sString(s string) (%[1]s, error) {
-	if val, ok := _%[1]sNameToValueMap[s]; ok {
-		return val, nil
+func %[1]sString(s string) (val %[1]s, err error) {
+	var ok = false
+	if val, ok = _%[1]sNameToValueMap[s]; !ok {
+		err = fmt.Errorf("%%s does not belong to %[1]s values", s)
 	}
-	return 0, fmt.Errorf("%%s does not belong to %[1]s values", s)
+	
+	return
+}
+`
+
+// Arguments to format are:
+//	[1]: type name
+const stringNameToValueMethodWithUnknownSupport = `// %[1]sString retrieves an enum value from the enum constants string name.
+// Throws an error if the param is not part of the enum.
+func %[1]sString(s string) (val %[1]s, err error) {
+	var ok = false
+	if val, ok = _%[1]sNameToValueMap[s]; ok {
+		return
+	}
+    
+    if val, ok = _%[1]sNameToValueMap[%[2]q]; !ok {
+		err = fmt.Errorf("%%s does not belong to %[1]s values", s)
+	}
+
+	return
 }
 `
 
@@ -42,40 +62,32 @@ func (i %[1]s) IsA%[1]s() bool {
 }
 `
 
-func (g *Generator) buildBasicExtras(runs [][]Value, values []Value, typeName string, runsThreshold int) {
+func (g *Generator) buildBasicExtras(runs [][]Value, values []Value, typeName string, runsThreshold int, unknown string) {
 	// At this moment, either "g.declareIndexAndNameVars()" or "g.declareNameVars()" has been called
 
 	// Print the slice of values
 	g.Printf("\nvar _%sValues = []%s{", typeName, typeName)
 	for _, value := range values {
-		//for _, value := range values {
 		g.Printf("\t%s, ", value.str)
-		//}
 	}
 	g.Printf("}\n\n")
 
 	// Print the map between name and value
 	g.Printf("\nvar _%sNameToValueMap = map[string]%s{\n", typeName, typeName)
-	//thereAreRuns := len(runs) > 1 && len(runs) <= runsThreshold
-	//var n int
-	//var runID string
 	for _, value := range values {
-		//if thereAreRuns {
-		//	runID = "_" + fmt.Sprintf("%d", i)
-		//	n = 0
-		//} else {
-		//	runID = ""
-		//}
-
 		for _, d := range value.decodes {
 			g.Printf("\t\"%s\": %s,\n", d, &value)
-			//n += len(value.name)
 		}
 	}
 	g.Printf("}\n\n")
 
 	// Print the basic extra methods
-	g.Printf(stringNameToValueMethod, typeName)
+	if unknown == "" {
+		g.Printf(stringNameToValueMethod, typeName)
+	} else {
+		g.Printf(stringNameToValueMethodWithUnknownSupport, typeName, unknown)
+	}
+
 	g.Printf(stringValuesMethod, typeName)
 	if len(runs) < runsThreshold {
 		g.Printf(stringBelongsMethodLoop, typeName)

@@ -16,7 +16,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/build"
-	exact "go/constant"
+	"go/constant"
 	"go/format"
 	"go/parser"
 	"go/token"
@@ -40,8 +40,8 @@ var (
 	output       = flag.String("output", "", "output file name; default srcdir/<type>_enumer.go")
 	decodeMethod = flag.String("decode", "", "enum item name decode supports, can be multiple. Default: noop")
 	encodeMethod = flag.String("encode", "", "enum item name encode support, supports single. Default: noop")
-	//transformMethod = flag.String("transform", "noop", "enum item name transformation method. Default: noop")
-	trimPrefix = flag.String("trimprefix", "", "transform each item name by removing a prefix. By default trims typeName")
+	unknown      = flag.String("unknown", "", "unknown enum. Default: none")
+	trimPrefix   = flag.String("trimprefix", "", "transform each item name by removing a prefix. By default trims typeName")
 )
 
 // Usage is a replacement usage function for the flags package.
@@ -104,7 +104,7 @@ func main() {
 
 	// Run generate for each type.
 	for _, typeName := range types {
-		g.generate(typeName, *json, *yaml, *sql, *text, *encodeMethod, *decodeMethod, *trimPrefix)
+		g.generate(typeName, *json, *yaml, *sql, *text, *encodeMethod, *decodeMethod, *trimPrefix, *unknown)
 	}
 
 	// Format the output.
@@ -284,7 +284,7 @@ func transformMethod(method string) (func(v string) string) {
 	return encoder
 }
 
-func (g *Generator) transformValues(values []Value, encodeMethod string, decodeMethod string) {
+func (g *Generator) transformValues(values []Value, encodeMethod string, decodeMethod string, trimPrefix string) {
 	var decodedMethods = strings.Split(decodeMethod, ",")
 
 	var encoder = transformMethod(encodeMethod)
@@ -297,26 +297,39 @@ func (g *Generator) transformValues(values []Value, encodeMethod string, decodeM
 	}
 
 	for i := range values {
+		values[i].name = strings.TrimPrefix(values[i].name, trimPrefix)
+		values[i].name = encoder(values[i].name)
+
 		// build decodes
-		values[i].decodes = make([]string, 0, 0)
-		for _, decoder := range decoders {
-			values[i].decodes = append(values[i].decodes, decoder(values[i].name))
+		var inputDecodes = values[i].decodes
+		var decodedValues = map[string]bool{}
+
+		for _, inputDecode := range inputDecodes {
+			inputDecode = strings.TrimPrefix(inputDecode, trimPrefix)
+			for _, decoder := range decoders {
+				var decodedValue = decoder(inputDecode)
+				decodedValues[decodedValue] = true
+			}
 		}
 
-		values[i].name = encoder(values[i].name)
-		values[i].decodes = append(values[i].decodes, values[i].name)
+		decodedValues[values[i].name] = true
+
+		values[i].decodes = make([]string, 0, 0)
+		for key := range decodedValues {
+			values[i].decodes = append(values[i].decodes, key)
+		}
 	}
 }
 
-// trimValueNames removes a prefix from each name
-func (g *Generator) trimValueNames(values []Value, prefix string) {
-	for i := range values {
-		values[i].name = strings.TrimPrefix(values[i].name, prefix)
-	}
-}
+//// trimValueNames removes a prefix from each name
+//func (g *Generator) trimValueNames(values []Value, prefix string) {
+//	for i := range values {
+//		values[i].name = strings.TrimPrefix(values[i].name, prefix)
+//	}
+//}
 
 // generate produces the String method for the named type.
-func (g *Generator) generate(typeName string, includeJSON, includeYAML, includeSQL, includeText bool, encodeMethod string, decodeMethod string, trimPrefix string) {
+func (g *Generator) generate(typeName string, includeJSON, includeYAML, includeSQL, includeText bool, encodeMethod string, decodeMethod string, trimPrefix string, unknown string) {
 	values := make([]Value, 0, 100)
 	for _, file := range g.pkg.files {
 		// Set the state for this run of the walker.
@@ -336,11 +349,12 @@ func (g *Generator) generate(typeName string, includeJSON, includeYAML, includeS
 		trimPrefix = typeName
 	}
 
-	g.trimValueNames(values, trimPrefix)
+	//g.trimValueNames(values, trimPrefix)
 
-	g.transformValues(values, encodeMethod, decodeMethod)
+	g.transformValues(values, encodeMethod, decodeMethod, trimPrefix)
 
 	runs := splitIntoRuns(values)
+
 	// The decision of which pattern to use depends on the number of
 	// runs in the numbers. If there's only one, it's easy. For more than
 	// one, there's a tradeoff between complexity and size of the data
@@ -354,16 +368,22 @@ func (g *Generator) generate(typeName string, includeJSON, includeYAML, includeS
 	// is very low. And bitmasks probably deserve their own analysis,
 	// to be done some other day.
 	const runsThreshold = 10
-	switch {
-	case len(runs) == 1:
-		g.buildOneRun(runs, typeName)
-	case len(runs) <= runsThreshold:
-		g.buildMultipleRuns(runs, typeName)
-	default:
+
+	if values[0].enumType == constant.String {
 		g.buildMap(runs, typeName)
+	} else {
+
+		switch {
+		case len(runs) == 1:
+			g.buildOneRun(runs, typeName)
+		case len(runs) <= runsThreshold:
+			g.buildMultipleRuns(runs, typeName)
+		default:
+			g.buildMap(runs, typeName)
+		}
 	}
 
-	g.buildBasicExtras(runs, values, typeName, runsThreshold)
+	g.buildBasicExtras(runs, values, typeName, runsThreshold, unknown)
 	if includeJSON {
 		g.buildJSONMethods(typeName)
 	}
@@ -432,9 +452,10 @@ type Value struct {
 	// this matters is when sorting.
 	// Much of the time the str field is all we need; it is printed
 	// by Value.String.
-	value  uint64 // Will be converted to int64 when needed.
-	signed bool   // Whether the constant is a signed type.
-	str    string // The string representation given by the "go/exact" package.
+	value    uint64 // Will be converted to int64 when needed.
+	signed   bool   // Whether the constant is a signed type.
+	str      string // The string representation given by the "go/exact" package.
+	enumType constant.Kind
 }
 
 func (v *Value) String() string {
@@ -465,6 +486,7 @@ func (f *File) genDecl(node ast.Node) bool {
 	// The name of the type of the constants we are declaring.
 	// Can change if this is a multi-element declaration.
 	typ := ""
+	index := 0
 	// Loop over the elements of the declaration. Each element is a ValueSpec:
 	// a list of names possibly followed by a type, possibly followed by values.
 	// If the type and value are both missing, we carry down the type (and value,
@@ -475,6 +497,7 @@ func (f *File) genDecl(node ast.Node) bool {
 			// "X = 1". With no type but a value, the constant is untyped.
 			// Skip this vspec and reset the remembered type.
 			typ = ""
+			index = 0
 			continue
 		}
 		if vspec.Type != nil {
@@ -503,31 +526,55 @@ func (f *File) genDecl(node ast.Node) bool {
 			if !ok {
 				log.Fatalf("no value for constant %s", name)
 			}
+
 			info := obj.Type().Underlying().(*types.Basic).Info()
-			if info&types.IsInteger == 0 {
+			if info&types.IsConstType == 0 {
 				log.Fatalf("can't handle non-integer constant type %s", typ)
 			}
 			value := obj.(*types.Const).Val() // Guaranteed to succeed as this is CONST.
-			if value.Kind() != exact.Int {
-				log.Fatalf("can't happen: constant is not an integer %s", name)
+			if value.Kind() == constant.Int {
+				i64, isInt := constant.Int64Val(value)
+				u64, isUint := constant.Uint64Val(value)
+				if !isInt && !isUint {
+					log.Fatalf("internal error: value of %s is not an integer: %s", name, value.String())
+				}
+				if !isInt {
+					u64 = uint64(i64)
+				}
+
+				v := Value{
+					name:     name.Name,
+					decodes:  []string{name.Name},
+					value:    u64,
+					signed:   info&types.IsUnsigned == 0,
+					str:      name.Name,
+					enumType: value.Kind(),
+				}
+				f.values = append(f.values, v)
+			} else if value.Kind() == constant.String {
+				if value.String() == "" {
+					log.Fatalf("internal error: value of %s is empty", name)
+				}
+
+				strValues := strings.Split(value.String(), "|")
+
+				v := Value{
+					name:     strValues[0],
+					decodes:  strValues,
+					value:    uint64(index),
+					signed:   false,
+					str:      name.Name,
+					enumType: value.Kind(),
+				}
+				f.values = append(f.values, v)
+
+				index++
+			} else {
+				log.Fatalf("can't happen: constant is not an integer or string %s", name)
 			}
-			i64, isInt := exact.Int64Val(value)
-			u64, isUint := exact.Uint64Val(value)
-			if !isInt && !isUint {
-				log.Fatalf("internal error: value of %s is not an integer: %s", name, value.String())
-			}
-			if !isInt {
-				u64 = uint64(i64)
-			}
-			v := Value{
-				name:   name.Name,
-				value:  u64,
-				signed: info&types.IsUnsigned == 0,
-				str:    value.String(),
-			}
-			f.values = append(f.values, v)
 		}
 	}
+
 	return false
 }
 
@@ -619,6 +666,7 @@ func (g *Generator) buildOneRun(runs [][]Value, typeName string) {
 	if values[0].signed {
 		lessThanZero = "i < 0 || "
 	}
+
 	if values[0].value == 0 { // Signed or unsigned, 0 is still 0.
 		g.Printf(stringOneRun, typeName, usize(len(values)), lessThanZero)
 	} else {
@@ -694,7 +742,11 @@ func (g *Generator) buildMap(runs [][]Value, typeName string) {
 		}
 	}
 	g.Printf("}\n\n")
-	g.Printf(stringMap, typeName)
+	if runs[0][0].enumType == constant.String {
+		g.Printf(stringMapForStringKind, typeName)
+	} else {
+		g.Printf(stringMap, typeName)
+	}
 }
 
 // Argument to format is the type name.
@@ -703,5 +755,14 @@ const stringMap = `func (i %[1]s) String() string {
 		return str
 	}
 	return fmt.Sprintf("%[1]s(%%d)", i)
+}
+`
+
+// Argument to format is the type name.
+const stringMapForStringKind = `func (i %[1]s) String() string {
+	if str, ok := _%[1]sMap[i]; ok {
+		return str
+	}
+	return ""
 }
 `
